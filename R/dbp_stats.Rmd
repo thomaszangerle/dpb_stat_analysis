@@ -1,0 +1,333 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+params:
+    name : "2018-11-20"
+title : "DBP stats for `r params$name`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+library(tidyverse)
+library(scales)
+library(lemon)
+library(knitr)
+theme_set(theme_light())
+source("dbp_stat_functions.R")
+```
+
+```{r lens, include = FALSE}
+lens <- read_delim(str_c("../data/",params$name, ".csv"), delim = ";") %>% 
+    mutate(
+        LMMEASDONE = parse_logical(LMMEASDONE),
+        POS34VALID = parse_logical(POS34VALID),
+        POSPEVALID = parse_logical(POSPEVALID),
+        POLAR = parse_logical(POLAR),
+        DBPVALID = parse_logical(DBPVALID),
+        TOLVPRVH = get_tolvprvh(LDDRSPH, LDDRCYL),
+        TOLVPRVV = get_tolvprvv(LDDRSPH, LDDRCYL)
+        )
+```
+
+## 1. Data processing and lens statistics
+
+```{r lens_filter1}
+lens_filter1 <- lens %>% 
+    filter(
+        str_detect(LTYPE, "PR"),
+        #ENGLOC== "B",
+        LMMEASDONE == TRUE
+    ) %>% 
+    mutate(
+        POSPEID = factor(POSPEID),
+        POSPEID = fct_recode(POSPEID, 
+                             AutoPosPE = "0", 
+                             SquareNotFound = "20060", 
+                             EyeNotFound  = "20217"
+                             )
+    )
+            
+```
+
+The applied filter selects the rows that are compliant with the following conditions :
+
+* LTYPE includes PR
+* ENGLOC==B > not enabled since ENGLOC is set to TRUE for some reason
+* DLM TResult Measurement done flag is at TRUE 
+
+The total number of lenses included is : `r lens_filter1 %>% nrow`.
+
+Some basic statistics :
+
+```{r lens statistics}
+lens_filter1 %>% 
+    mutate(
+        LDDRSEQ = LDDRSPH + LDDRCYL/2,
+        LDDRCYL = abs(LDDRCYL)
+        ) %>% 
+    select(LDDRSEQ, LDDRCYL, LDADD) %>% 
+    gather(NAME, VALUE) %>% 
+    mutate(NAME = factor(NAME, levels = c("LDDRSEQ", "LDDRCYL", "LDADD"))) %>% 
+    ggplot(aes(VALUE)) +
+    geom_histogram(bins = 20, aes(fill = NAME), color = "black", alpha = 1) +
+    facet_wrap(~ NAME, scales = "free")+
+    guides(fill = FALSE)+
+    labs(
+        x = "[D]",
+        y = "",
+        title = ""
+    )
+    
+```
+
+
+## 2. Preliminary engravings detection and position 
+
+### 2.1 PE Automatic detection rate
+
+```{r}
+geom_bar_cnt(lens_filter1, "POSPEID")
+```
+
+
+### 2.2 Preliminary engraving position vs. expected
+
+
+Here the comparison of the position of the PRP based on the engravings at 34mm
+and the PRP based on the preliminary engravings.
+
+
+```{r lens_auto}
+lens_auto <- lens_filter1 %>% 
+   filter(POSPEID == "AutoPosPE")
+```
+
+
+```{r PrpDelta_plot}
+lens_auto %>% 
+    mutate(
+       fcocx = FCOCIN * ((EYE=="R")-(EYE=="L")),
+       fcocy = FCOCUP,
+       PrpDeltaX = POSPEX + TPERRPEX + fcocx - (POS34X + TPERR34X),
+       PrpDeltaY = POSPEY + TPERRPEY + fcocy - (POS34Y + TPERR34Y),
+       PrpDeltaT = ((POSPET + TPERRPET)-(POS34T+TPERR34T))%%180.0-90
+       ) %>%
+    select(PrpDeltaX, PrpDeltaY, PrpDeltaT) %>%
+    gather(Name, Value) %>% 
+    mutate(Name = factor(Name, levels = c("PrpDeltaX", "PrpDeltaY", "PrpDeltaT"))) %>% 
+    ggplot(aes(Value))+
+    geom_histogram(bins = 20, color = "black", aes(fill = Name), alpha = 1) +
+    scale_x_symmetric(lim = c(-1.,1.))+
+    guides(fill = FALSE)+
+    facet_wrap(~ Name) +
+    labs(
+        x = "",
+        y = "",
+        title = "Error on PE position"
+    )
+```
+
+## 3. DBP success rate and output
+
+### 3.1 DBP success rate
+Here is the percentage of successful DBP processing.
+
+```{r DBP_success_rate_plot}
+lens_auto %>% 
+    mutate(
+        DBPVALID = fct_recode(as.factor(DBPVALID), DBP_VALID = "TRUE", DBP_NOT_VALID = "FALSE")
+        ) %>% 
+    geom_bar_cnt("DBPVALID")
+```
+
+See the appendix for a list of the jobs with unsucessful DBP.
+
+### 3.2 DBP values
+
+Percentage of DBP values in interval [-2,2] for x and y and [-5,5] for $\theta$.
+
+```{r}
+lens_auto %>% 
+    filter(DBPVALID == TRUE) %>% 
+    mutate(
+        DBPINLIMIT = abs(DBPX) <= 2 && abs(DBPY) <= 2 && abs(DBPT) <= 5,
+        DBPINLIMIT = fct_recode(as.factor(DBPINLIMIT), DBP_VAL_IN_LIM = "TRUE", DBP_VAL_OUT_LIM = "FALSE") 
+    ) %>% 
+    geom_bar_cnt("DBPINLIMIT")
+```
+
+
+```{r DBP X, Y and T plots}
+lens_auto %>% 
+    filter(DBPVALID == TRUE) %>% 
+    select(DBPX, DBPY, DBPT) %>% 
+    gather(NAME, VALUE) %>% 
+    mutate(NAME = factor(NAME, levels = c("DBPX", "DBPY", "DBPT"))) %>% 
+    ggplot(aes(VALUE)) +
+    geom_histogram(bins = 20, aes(fill = NAME), color = "black", alpha = 1) +
+    scale_x_symmetric(lim = c(-3,3))+
+    facet_wrap(~ NAME)+
+    guides(fill = FALSE)+
+    labs(
+        x = "",
+        y = "",
+        title = "DBP values"
+    )
+```
+
+### 3.3 DBP FE and SE values
+
+These are the two validity criteria for the DBP.
+DBPFE represents the average error and DBPSE the sensitivity
+against shifting.
+
+```{r DBP FE and SE plots}
+lens_auto %>% 
+    filter(DBPVALID == TRUE) %>% 
+    select(DBPFE, DBPSE) %>% 
+    gather(NAME, VALUE) %>% 
+    ggplot(aes(VALUE)) +
+    geom_histogram(bins = 30, aes(fill = NAME), color = "black", alpha = 1)+
+    facet_wrap(~ NAME) +
+    guides(fill = FALSE) +
+    labs(
+        x = "",
+        y = ""
+    )
+```
+
+## 4. Errors statistics with DBP OFF and ON
+
+### 4.1 Relative prism error with DBP OFF and ON
+
+Here are the relative error on the prismatic powers. 
+This errors are the difference between the measured values and the verifications value divided by the tolerance
+compliant with the ISO8980-2. The values with and without DBP are compared.
+
+```{r rel prism errors}
+lens_auto %>% 
+    mutate(
+        INSPRVH_DBP = extrapolate_prvh(INSPRVH, INSPRVV, INSPRSPH, INSPRCYL, INSPRAX,
+                                        -DBPX, -DBPY, -DBPT),
+        INSPRVV_DBP = extrapolate_prvv(INSPRVH, INSPRVV, INSPRSPH, INSPRCYL, INSPRAX,
+                                        -DBPX, -DBPY, -DBPT),
+        REL_DPRVH = (INSPRVH-LDPRVH)/TOLVPRVH,
+        REL_DPRVV = (INSPRVV-LDPRVV)/TOLVPRVV,
+        REL_DPRVH_DBP = (INSPRVH_DBP - LDPRVH)/TOLVPRVH,
+        REL_DPRVV_DBP = (INSPRVV_DBP - LDPRVV)/TOLVPRVV
+        ) %>% 
+    select(REL_DPRVH:REL_DPRVV_DBP) %>% 
+    gather(NAME, VALUE) %>% 
+    mutate(
+        DBP = str_detect(NAME, "DBP"),
+        DBP = fct_recode(as.factor(DBP), DPB_OFF = "FALSE", DBP_ON = "TRUE"),
+        NAME = str_replace(NAME, "_DBP", "")
+        ) %>% 
+    ggplot(aes(VALUE)) + 
+    geom_histogram(bins = 50, aes(fill = NAME), color = "black", alpha = 1)+
+    facet_grid(DBP ~ NAME) +
+    guides(fill = FALSE) +
+    scale_x_symmetric(lim = c(-1,1), labels = percent)+
+    labs(
+        x = "Relative prismatic error [%]",
+        y = ""
+    )
+```
+
+### 4.2 Vector cylinder power errors with DBP OFF and ON
+
+```{r cylv errors}
+lens_auto %>% 
+    mutate(
+        DAX = -DBPT,
+        INSDRAX_DBP = INSDRAX-DAX,
+        DCYLV = cylv_diff(INSDRCYL, INSDRAX, LDDRCYL, LDDRAX),
+        DCYLV_DBP = cylv_diff(INSDRCYL, INSDRAX_DBP, LDDRCYL, LDDRAX)
+    ) %>% 
+    select(DCYLV, DCYLV_DBP) %>% 
+    gather(NAME, VALUE) %>% 
+    mutate(
+        DBP = str_detect(NAME, "DBP"),
+        DBP = fct_recode(as.factor(DBP), DPB_OFF = "FALSE", DBP_ON = "TRUE"),
+        NAME = str_replace(NAME, "_DBP", "")
+        ) %>% 
+    ggplot(aes(VALUE)) + 
+    #geom_freqpoly(bins = 50, aes(color = DBP)) +
+    geom_histogram(bins = 30, aes(fill = DBP), color = "black", alpha = 1)+
+    facet_wrap(~DBP) +
+    guides(fill = FALSE) +
+    scale_x_continuous(lim = c(0,0.25))+
+    labs(
+        x = "CYLV errors [D]",
+        y = ""
+    )
+    
+```
+
+### 4.3 GMC statistics with DBP OFF and ON
+
+```{r INSGMC}
+lens_auto %>% 
+    select(INSGMC, INSGMCDBP) %>% 
+    gather(NAME, VALUE) %>% 
+    mutate(
+        DBP = str_detect(NAME, "DBP"),
+        DBP = fct_recode(as.factor(DBP), DPB_OFF = "FALSE", DBP_ON = "TRUE"),
+        NAME = str_replace(NAME, "DBP", "")
+        ) %>% 
+    ggplot(aes(VALUE)) + 
+    #geom_freqpoly(bins = 50, aes(color = DBP)) +
+    geom_histogram(bins = 30, aes(fill = DBP), color = "black", alpha = 1)+
+    guides(fill = FALSE) +
+    facet_wrap(~ DBP) +
+    scale_x_continuous(lim = c(0,0.5))+
+    labs(
+        x = "INSGMC",
+        y = ""
+    )
+```
+
+### 4.4 AV statistics with DBP OFF and ON
+
+```{r}
+lens_auto %>% 
+    select(INSAV, INSAVDBP) %>% 
+    gather(NAME, VALUE) %>% 
+    mutate(
+        DBP = str_detect(NAME, "DBP"),
+        DBP = fct_recode(as.factor(DBP), DPB_OFF = "FALSE", DBP_ON = "TRUE"),
+        NAME = str_replace(NAME, "DBP", "")
+        ) %>% 
+    ggplot(aes(VALUE)) + 
+    #geom_freqpoly(bins = 50, aes(color = DBP)) +
+    geom_histogram(bins = 30, aes(fill = DBP), color = "black", alpha = 1)+
+    facet_wrap(~DBP) +
+    guides(fill = FALSE) +
+    scale_x_continuous(lim = c(0,0.25))+
+    labs(
+        x = "INSAV [D]",
+        y = ""
+    )
+```
+
+
+## Appendix
+
+### Unsucessfull DBP jobs
+
+```{r}
+lens_auto %>% 
+    filter(DBPVALID == FALSE) %>% 
+    select(JOB, EYE, DBPVALID) %>% 
+    kable()
+```
+
+
+
+
+
+
+
+
+
