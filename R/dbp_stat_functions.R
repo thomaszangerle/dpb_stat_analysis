@@ -10,6 +10,7 @@ geom_bar_cnt <- function(df, col){
             labely = per+0.02, 
             labelt = percent(per)
             ) %>% 
+        mutate(col = fct_reorder(as.factor(col), desc("n"))) %>% 
         ggplot(aes_string(x = col, fill = col, y="per")) +
         geom_bar(stat =  "identity", color = "black") +
         geom_text(aes_string(x = col, y = "labely", label = "labelt")) +

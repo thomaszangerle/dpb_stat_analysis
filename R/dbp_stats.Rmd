@@ -13,55 +13,63 @@ library(tidyverse)
 library(scales)
 library(lemon)
 library(knitr)
+library(lubridate)
+library(REdaS)
 theme_set(theme_light())
-source("dbp_stat_functions.R")
+source("../R/dbp_stat_functions.R")
 ```
 
 ```{r lens, include = FALSE}
 lens <- read_delim(str_c("../data/",params$name, ".csv"), delim = ";") %>% 
     mutate(
-        LMMEASDONE = parse_logical(LMMEASDONE),
         POS34VALID = parse_logical(POS34VALID),
         POSPEVALID = parse_logical(POSPEVALID),
         POLAR = parse_logical(POLAR),
         DBPVALID = parse_logical(DBPVALID),
         TOLVPRVH = get_tolvprvh(LDDRSPH, LDDRCYL),
-        TOLVPRVV = get_tolvprvv(LDDRSPH, LDDRCYL)
-        )
-```
-
-## 1. Data processing and lens statistics
-
-```{r lens_filter1}
-lens_filter1 <- lens %>% 
-    filter(
-        str_detect(LTYPE, "PR"),
-        #ENGLOC== "B",
-        LMMEASDONE == TRUE
-    ) %>% 
-    mutate(
+        TOLVPRVV = get_tolvprvv(LDDRSPH, LDDRCYL),
+        TIMESTAMP = ymd_hms(TIMESTAMP),
         POSPEID = factor(POSPEID),
         POSPEID = fct_recode(POSPEID, 
                              AutoPosPE = "0", 
                              SquareNotFound = "20060", 
                              EyeNotFound  = "20217"
-                             )
-    )
-            
+                             ),
+        LMERRCODE = as.factor(LMERRCODE),
+        LMTDONE = parse_logical(LMTDONE),
+        LMRDONE = parse_logical(LMRDONE),
+        LMERRCODE = fct_recode(LMERRCODE, 
+                                NoError = "0",
+                                NoError = "21273",
+                                NoError = "21315",
+                                PatternError = "21013",
+                                PatternError = "21223",
+                                ProtectedMemoryError = "20899"
+                                )
+        )
+```
+
+## 1. Data processing and lens statistics
+
+```{r lens_pr}
+lens_pr <- lens %>% 
+    filter(
+        !(LMTDONE == FALSE & LMRDONE == FALSE & LMERRCODE == "NoError"),
+        str_detect(LTYPE, "PR")
+        )
 ```
 
 The applied filter selects the rows that are compliant with the following conditions :
 
 * LTYPE includes PR
-* ENGLOC==B > not enabled since ENGLOC is set to TRUE for some reason
-* DLM TResult Measurement done flag is at TRUE 
+* !(DLM.ReflectionResults.Done == FALSE && DLM.TResults == FALSE && DLM.LMERRCODE ==  0)
 
-The total number of lenses included is : `r lens_filter1 %>% nrow`.
+The total number of lenses included is : `r lens_pr %>% nrow`.
 
 Some basic statistics :
 
 ```{r lens statistics}
-lens_filter1 %>% 
+lens_pr %>% 
     mutate(
         LDDRSEQ = LDDRSPH + LDDRCYL/2,
         LDDRCYL = abs(LDDRCYL)
@@ -87,7 +95,7 @@ lens_filter1 %>%
 ### 2.1 PE Automatic detection rate
 
 ```{r}
-geom_bar_cnt(lens_filter1, "POSPEID")
+geom_bar_cnt(lens_pr, "POSPEID")
 ```
 
 
@@ -99,13 +107,13 @@ and the PRP based on the preliminary engravings.
 
 
 ```{r lens_auto}
-lens_auto <- lens_filter1 %>% 
+lens_pe_auto <- lens_pr %>% 
    filter(POSPEID == "AutoPosPE")
 ```
 
 
 ```{r PrpDelta_plot}
-lens_auto %>% 
+lens_pe_auto %>% 
     mutate(
        fcocx = FCOCIN * ((EYE=="R")-(EYE=="L")),
        fcocy = FCOCUP,
@@ -124,31 +132,53 @@ lens_auto %>%
     labs(
         x = "",
         y = "",
-        title = "Error on PE position"
+        title = "Discrepencies between PE and 34mm engravings"
     )
 ```
 
-## 3. DBP success rate and output
+## 3. DLM and DBP success rate and output
 
-### 3.1 DBP success rate
-Here is the percentage of successful DBP processing.
+### 3.1 DLM Error statistics
+
+
+Here is the distribution of the DLM errors for the filtered lenses.
+Note that a GNG error or GNG not tested is considered as no error here.
+
+```{r}
+geom_bar_cnt(lens_pr, "LMERRCODE")
+```
+```{r lens_pr_noerr}
+lens_pr_noerr <- lens_pr %>% 
+    filter(LMERRCODE == "NoError")
+```
+
+
+
+### 3.2 DBP success rate
+Among the lenses without an error at teh DLM , here is the percentage of successful DBP processing.
 
 ```{r DBP_success_rate_plot}
-lens_auto %>% 
+lens_pr_noerr %>% 
     mutate(
         DBPVALID = fct_recode(as.factor(DBPVALID), DBP_VALID = "TRUE", DBP_NOT_VALID = "FALSE")
         ) %>% 
     geom_bar_cnt("DBPVALID")
 ```
 
+```{r}
+lens_pr_noerr_dbpvalid <- lens_pr_noerr %>% 
+    filter(DBPVALID == TRUE)
+```
+
+
 See the appendix for a list of the jobs with unsucessful DBP.
 
-### 3.2 DBP values
+### 3.3 DBP values
 
 Percentage of DBP values in interval [-2,2] for x and y and [-5,5] for $\theta$.
 
 ```{r}
-lens_auto %>% 
+lens_pr_noerr_dbpvalid %>% 
     filter(DBPVALID == TRUE) %>% 
     mutate(
         DBPINLIMIT = abs(DBPX) <= 2 && abs(DBPY) <= 2 && abs(DBPT) <= 5,
@@ -159,8 +189,7 @@ lens_auto %>%
 
 
 ```{r DBP X, Y and T plots}
-lens_auto %>% 
-    filter(DBPVALID == TRUE) %>% 
+lens_pr_noerr_dbpvalid %>% 
     select(DBPX, DBPY, DBPT) %>% 
     gather(NAME, VALUE) %>% 
     mutate(NAME = factor(NAME, levels = c("DBPX", "DBPY", "DBPT"))) %>% 
@@ -176,15 +205,14 @@ lens_auto %>%
     )
 ```
 
-### 3.3 DBP FE and SE values
+### 3.4 DBP FE and SE values
 
 These are the two validity criteria for the DBP.
 DBPFE represents the average error and DBPSE the sensitivity
 against shifting.
 
 ```{r DBP FE and SE plots}
-lens_auto %>% 
-    filter(DBPVALID == TRUE) %>% 
+lens_pr_noerr_dbpvalid %>% 
     select(DBPFE, DBPSE) %>% 
     gather(NAME, VALUE) %>% 
     ggplot(aes(VALUE)) +
@@ -206,7 +234,7 @@ This errors are the difference between the measured values and the verifications
 compliant with the ISO8980-2. The values with and without DBP are compared.
 
 ```{r rel prism errors}
-lens_auto %>% 
+lens_pr_noerr_dbpvalid %>% 
     mutate(
         INSPRVH_DBP = extrapolate_prvh(INSPRVH, INSPRVV, INSPRSPH, INSPRCYL, INSPRAX,
                                         -DBPX, -DBPY, -DBPT),
@@ -238,7 +266,7 @@ lens_auto %>%
 ### 4.2 Vector cylinder power errors with DBP OFF and ON
 
 ```{r cylv errors}
-lens_auto %>% 
+lens_pr_noerr_dbpvalid %>% 
     mutate(
         DAX = -DBPT,
         INSDRAX_DBP = INSDRAX-DAX,
@@ -268,7 +296,7 @@ lens_auto %>%
 ### 4.3 GMC statistics with DBP OFF and ON
 
 ```{r INSGMC}
-lens_auto %>% 
+lens_pr_noerr_dbpvalid %>% 
     select(INSGMC, INSGMCDBP) %>% 
     gather(NAME, VALUE) %>% 
     mutate(
@@ -291,7 +319,7 @@ lens_auto %>%
 ### 4.4 AV statistics with DBP OFF and ON
 
 ```{r}
-lens_auto %>% 
+lens_pr_noerr_dbpvalid %>% 
     select(INSAV, INSAVDBP) %>% 
     gather(NAME, VALUE) %>% 
     mutate(
@@ -316,10 +344,51 @@ lens_auto %>%
 
 ### Unsucessfull DBP jobs
 
-```{r}
-lens_auto %>% 
+```{r lens_auto_dbp_nv}
+lens_pr_noerr_dbpnotvalid <- lens_pr_noerr %>% 
     filter(DBPVALID == FALSE) %>% 
-    select(JOB, EYE, DBPVALID) %>% 
+    mutate(
+        ERRDRSEQ = INSDRSPH+0.5*INSDRCYL-(LDDRSPH+0.5*LDDRCYL),
+        ERRDRCYLV = sqrt(
+            (INSDRCYL*cos(deg2rad(2*INSDRAX))-LDDRCYL*cos(deg2rad(2*LDDRAX)))^2+
+            (INSDRCYL*sin(deg2rad(2*INSDRAX))-LDDRCYL*sin(deg2rad(2*LDDRAX)))^2
+        )
+    )
+```
+
+
+Let's look at the `r lens_pr_noerr_dbpnotvalid %>% nrow()` lenses with unsucessful DBP and examine the 
+INSGMC and INSAV values.
+
+
+```{r}
+lens_pr_noerr_dbpnotvalid %>% 
+    mutate(TIMESTAMP = date(TIMESTAMP)) %>%
+    select(TIMESTAMP, JOB, EYE, DBPVALID, INSGMC, INSAV, ERRDRSEQ, ERRDRCYLV, LMERRCODE) %>%
+    arrange(desc(abs(INSAV), INSGMC)) %>% 
+    kable()
+```
+
+Let's remove the lenses with a INSAV value greater than 0.5 (in absolute value), a GMC greater than 1
+or a ERRCYLV error greater than 0.5.
+
+
+```{r, lens_pr_noerr_dbpnotvalid_analyse}
+lens_pr_noerr_dbpnotvalid_analyse <- lens_pr_noerr_dbpnotvalid %>% 
+        filter(
+        DBPVALID == FALSE,
+        is.na(INSAV) | abs(INSAV) <= 0.5,
+        is.na(INSAV) | abs(INSGMC) <= 1,
+        is.na(ERRDRCYLV) | abs(ERRDRCYLV) <= 0.5
+        ) 
+```
+The number of remaining lenses is `r lens_pr_noerr_dbpnotvalid_analyse %>% nrow()`.
+
+```{r}
+lens_pr_noerr_dbpnotvalid_analyse %>% 
+    mutate(TIMESTAMP = date(TIMESTAMP)) %>% 
+    select(TIMESTAMP, JOB, EYE, DBPVALID, INSGMC, INSAV, ERRDRSEQ, ERRDRCYLV, LMERRCODE) %>%
+    arrange(desc(abs(INSAV), INSGMC)) %>% 
     kable()
 ```
 
