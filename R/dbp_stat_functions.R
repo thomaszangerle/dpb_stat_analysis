@@ -23,12 +23,12 @@ geom_bar_cnt <- function(df, col){
 }
 
 get_tolvprvh <- function(sph, cyl){
-    s <- max(abs(sph), abs(sph+cyl))
+    s <- pmax(abs(sph), abs(sph+cyl))
     0.25 + 0.1*s
 }
 
 get_tolvprvv <- function(sph, cyl){
-    s <- max(abs(sph), abs(sph+cyl))
+    s <- pmax(abs(sph), abs(sph+cyl))
     0.25 + 0.05*s
 }
 

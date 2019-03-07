@@ -7,7 +7,10 @@ params:
   name: dbp_sim_data_20190226
 editor_options:
   chunk_output_type: console
+header-includes:
+  - \usepackage{draftwatermark}
 ---
+
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
@@ -44,10 +47,6 @@ lens <- read_delim(str_c("data/",params$name, ".csv"), delim = ";",
                                   )
 ) %>% 
     mutate(
-        #POS34VALID = parse_logical(POS34VALID),
-        #POSPEVALID = parse_logical(POSPEVALID),
-        #POLAR = parse_logical(POLAR),
-        #DBPVALID = parse_logical(DBPVALID),
         TOLVPRVH = get_tolvprvh(LDDRSPH, LDDRCYL),
         TOLVPRVV = get_tolvprvv(LDDRSPH, LDDRCYL),
         TIMESTAMP = ymd_hms(TIMESTAMP),
@@ -60,16 +59,38 @@ lens <- read_delim(str_c("data/",params$name, ".csv"), delim = ";",
                              InvalidMode = "20202"
                              ),
         LMERRCODE = as.factor(LMERRCODE),
-        #LMTDONE = parse_logical(LMTDONE),
-        #LMRDONE = parse_logical(LMRDONE),
         LMERRCODE = fct_recode(LMERRCODE, 
                                 NoError = "0",
                                 NoError = "21273",
                                 NoError = "21315",
                                 PatternError = "21013",
                                 PatternError = "21223",
-                                ProtectedMemoryError = "20899"
+                                ProtectedMemoryError = "20899",
+                                TransmissionError = "21246"
                                 )
+        ) %>%
+    mutate(
+       fcocx = FCOCIN * ((EYE=="R")-(EYE=="L")),
+       fcocy = FCOCUP,
+       PrpDeltaX = POSPEX + TPERRPEX + fcocx - (POS34X + TPERR34X),
+       PrpDeltaY = POSPEY + TPERRPEY + fcocy - (POS34Y + TPERR34Y),
+       PrpDeltaT = ((POSPET + TPERRPET)-(POS34T+TPERR34T)) -90*(EYE=="R")-270*(EYE=="L"),
+       PrpDeltaT = ifelse(PrpDeltaT > 180, PrpDeltaT-360, PrpDeltaT),
+       PrpDeltaT = ifelse(PrpDeltaT < -180, PrpDeltaT+360, PrpDeltaT)
+       ) %>% 
+    mutate(
+        LDDRSEQ = LDDRSPH + LDDRCYL/2
+        # LDDRCYL = abs(LDDRCYL)
+        ) %>% 
+    mutate(
+        INSPRVH_DBP = extrapolate_prvh(INSPRVH, INSPRVV, INSPRSPH, INSPRCYL, INSPRAX,
+                                        -DBPX, -DBPY, -DBPT),
+        INSPRVV_DBP = extrapolate_prvv(INSPRVH, INSPRVV, INSPRSPH, INSPRCYL, INSPRAX,
+                                        -DBPX, -DBPY, -DBPT),
+        REL_DPRVH = (INSPRVH-LDPRVH)/TOLVPRVH,
+        REL_DPRVV = (INSPRVV-LDPRVV)/TOLVPRVV,
+        REL_DPRVH_DBP = (INSPRVH_DBP - LDPRVH)/TOLVPRVH,
+        REL_DPRVV_DBP = (INSPRVV_DBP - LDPRVV)/TOLVPRVV
         )
 ```
 
@@ -79,7 +100,11 @@ lens <- read_delim(str_c("data/",params$name, ".csv"), delim = ";",
 lens_pr <- lens %>% 
     filter(
         !(LMTDONE == FALSE & LMRDONE == FALSE & LMERRCODE == "NoError"),
-        str_detect(LTYPE, "PR FF")
+        str_detect(LTYPE, "PR FF"),
+        POS34VALID == TRUE,
+        POS34MANU == FALSE,
+        is.na(INSADD) == FALSE & is.nan(INSADD) == FALSE,
+        POSPEID != "InvalidMode"
         )
 ```
 
@@ -87,17 +112,16 @@ The applied filter selects the rows that are compliant with the following condit
 
 * LTYPE includes PR FF
 * !(DLM.ReflectionResults.Done == FALSE && DLM.TResults == FALSE && DLM.LMERRCODE ==  0)
+* POS34VALID == TRUE & POS34MANU == FALSE (automatic detection of the 34mm engravings)
+* is.na(INSADD) == FALSE & is.nan(INSADD) == FALSE (valid measurement at Foco)
+* POSPEID != "InvalidMode" (error when PPOS is in invalid mode, happens only in A&R mode - very rare)
 
 The total number of lenses included is : `r lens_pr %>% nrow`.
 
-Some basic statistics :
+Some basic statistics about the power, cylinder and addition :
 
 ```{r lens statistics}
 lens_pr %>% 
-    mutate(
-        LDDRSEQ = LDDRSPH + LDDRCYL/2,
-        LDDRCYL = abs(LDDRCYL)
-        ) %>% 
     select(LDDRSEQ, LDDRCYL, LDADD) %>% 
     gather(NAME, VALUE) %>% 
     mutate(NAME = factor(NAME, levels = c("LDDRSEQ", "LDDRCYL", "LDADD"))) %>% 
@@ -116,99 +140,80 @@ lens_pr %>%
 
 ## 2. Preliminary engravings detection and position 
 
-### 2.1 PE Automatic detection rate
-
-```{r}
-geom_bar_cnt(lens_pr, "POSPEID")
-```
-
-
-More details about errors per LDVEN : 
+### 2.1 Filter lenses with 180° errors on the 34mm engravings
 
 ```{r}
 lens_pr %>% 
-    #filter(POSPEID == "SquareNotFound") %>% 
-    ggplot(aes(POSPEID, fill = LDVEN)) +
-    geom_bar()
+    mutate(ENG34_180_ERROR = INSADD < 0) %>% 
+    count(ENG34_180_ERROR) %>% 
+    mutate(per = n/sum(n)*100) %>% 
+    kable(digits = 2)
 ```
 
-More details about the SquareNotFound error for Essilor designs:
+
+Let's remove these 5 lenses from the dataset.
+
+### 2.2 Detect lenses with automatic PE detection bu wrong PE x-y location
+
+```{r}
+lens_pr <- lens_pr %>% 
+    mutate(
+         POSPEID_char = POSPEID %>% as.character(),
+         POSPEID_char = ifelse(
+             as.character(POSPEID_char) == "AutoPosPE" & (abs(PrpDeltaX) > 2 | abs(PrpDeltaY) > 2),
+             "AutoPosPE_WrongXY", 
+             POSPEID_char
+             ),
+         POSPEID_char = ifelse(
+             as.character(POSPEID_char) == "AutoPosPE" & abs(round(PrpDeltaT)) == 180 ,
+             "AutoPosPE_180Err", 
+             POSPEID_char),
+         POSPEID = as.factor(POSPEID_char)
+         )
+```
 
 ```{r}
 lens_pr %>% 
-    filter(POSPEID == "SquareNotFound", LDVEN == "ESSILOR") %>% 
-    count(LNAME) %>% 
-    arrange(desc(n)) %>% 
-    mutate(LNAME = fct_reorder(as.factor(LNAME), n)) %>% 
-    ggplot(aes(x = LNAME, y = n, fill = LNAME)) + 
-    geom_bar(stat = "identity") +
-    coord_flip() +
-    guides(fill = FALSE) +
+    count(POSPEID) %>% 
+    mutate(
+        POSPEID = fct_reorder(POSPEID, n),
+        percents = n/sum(n),
+        labely = percents + 0.07,
+        labelt = percent(percents, accuracy = 0.01)
+        ) %>% 
+    ggplot(aes(POSPEID, percents, fill = POSPEID)) +
+    geom_bar(stat =  "identity", color = "black") +
+    geom_text(aes(y = labely, label = labelt)) +
+    scale_y_continuous(labels = percent, limits = c(0, 1.1), breaks = seq(0, 1, by = 0.2))+
     labs(
-        title = "Essilor LNAME leading to SquareNotFoundError",
-        y = "Number of misses",
-        x = "LNAME"
-    )
+        title = "PE detection performance",
+        y = "",
+        x = ""
+        )+
+    guides(fill=FALSE)+
+    coord_flip()
 ```
-
-```{r}
-lens_pr %>% 
-    mutate(SPH = round(LDDRSPH) %>% as.factor()) %>% 
-    filter(POSPEID %in% c("AutoPosPE", "SquareNotFound")) %>% 
-    mutate(SNF = (POSPEID == "SquareNotFound")) %>% 
-    group_by(SPH) %>% 
-    summarize(SNF_per = mean(SNF)) %>% 
-    ggplot(aes(x = SPH, y = SNF_per, fill = SPH)) +
-    geom_col()+
-    scale_y_continuous(labels = percent)+
-    labs(
-        title = "Percentage of SquareNotFound errors vs. power",
-        x = "SPH[D]",
-        y = "%"
-    )
-```
-
-More details about the Eye NotFound Error
-
-```{r}
-lens_pr %>% 
-    filter(POSPEID == "EyeNotFound") %>% 
-    count(LNAME, LDVEN) %>% 
-    ggplot(aes(fct_reorder(LNAME, n), n, fill = LDVEN))+ 
-    geom_col()+
-    coord_flip()+
-    labs(
-        title = "LNAME creating EyeNotFound errors for the PE engravings",
-        x = "LNAME",
-        y = ""
-    )
-```
-
-
-
 
 ### 2.2 Preliminary engraving position vs. expected
 
 
 Here the comparison of the position of the PRP based on the engravings at 34mm
-and the PRP based on the preliminary engravings.
+and the PRP based on the preliminary engravings. Only the lenses with auto-positioning
+for both pairs of engravings and no 180° error are considered.
 
 
 ```{r lens_auto}
 lens_pe_auto <- lens_pr %>% 
-   filter(POSPEID == "AutoPosPE")
+   filter(
+       POSPEID == "AutoPosPE",
+       POS34MANU == FALSE
+       )
 ```
 
 
 ```{r PrpDelta_plot}
+
 lens_pe_auto %>% 
-    mutate(
-       fcocx = FCOCIN * ((EYE=="R")-(EYE=="L")),
-       fcocy = FCOCUP,
-       PrpDeltaX = POSPEX + TPERRPEX + fcocx - (POS34X + TPERR34X),
-       PrpDeltaY = POSPEY + TPERRPEY + fcocy - (POS34Y + TPERR34Y),
-       PrpDeltaT = ((POSPET + TPERRPET)-(POS34T+TPERR34T)) %%180.0-90
-       ) %>%
     select(PrpDeltaX, PrpDeltaY, PrpDeltaT) %>% 
     gather(Name, Value) %>% 
     mutate(Name = factor(Name, levels = c("PrpDeltaX", "PrpDeltaY", "PrpDeltaT"))) %>% 
@@ -224,33 +229,45 @@ lens_pe_auto %>%
     )
 ```
 
+
 #### Distribution averages
 
 ```{r}
 lens_pe_auto %>% 
-    mutate(
-       fcocx = FCOCIN * ((EYE=="R")-(EYE=="L")),
-       fcocy = FCOCUP,
-       PrpDeltaX = POSPEX + TPERRPEX + fcocx - (POS34X + TPERR34X),
-       PrpDeltaY = POSPEY + TPERRPEY + fcocy - (POS34Y + TPERR34Y),
-       PrpDeltaT = ((POSPET + TPERRPET)-(POS34T+TPERR34T)) %%180.0-90
-       ) %>%
     select(PrpDeltaX, PrpDeltaY, PrpDeltaT) %>% 
-    summarize_all(mean) %>% 
+    summarize_all(median) %>% 
     kable(digits = 2)
 ```
-
 
 ## 3. DLM and DBP success rate and output
 
 ### 3.1 DLM Error statistics
 
-
 Here is the distribution of the DLM errors for the filtered lenses.
 Note that a GNG error or GNG not tested is considered as no error here.
 
 ```{r}
-geom_bar_cnt(lens_pr, "LMERRCODE")
+
+lens_pr %>% 
+    count(LMERRCODE) %>% 
+    mutate(
+        LMERRCODE = fct_reorder(LMERRCODE, n),
+        percents = n/sum(n),
+        labely = percents + 0.07,
+        labelt = percent(percents, accuracy = 0.01)
+        ) %>% 
+    ggplot(aes(LMERRCODE, percents, fill = LMERRCODE)) +
+    geom_bar(stat =  "identity", color = "black") +
+    geom_text(aes(y = labely, label = labelt)) +
+    scale_y_continuous(labels = percent, limits = c(0, 1.1), breaks = seq(0, 1, by = 0.2))+
+    labs(
+        title = "LM error codes",
+        y = "",
+        x = ""
+        )+
+    guides(fill=FALSE)+
+    coord_flip()
+
 ```
 
 #### More info for the PatternError
@@ -277,59 +294,37 @@ lens_pr %>%
     )
 ```
 
-Here's the percentage of pattern error for each power
-(at least 50 lenses per power to be considered here)
-
-```{r}
-lens_pr %>% 
-    mutate(
-        HASPNE = (LMERRCODE == "PatternError"),
-        SPH = round(LDDRSPH),
-        SPH = as.factor(SPH),
-        LIND = round(LIND, digits = 2),
-        LIND = as.factor(LIND)
-        ) %>%  
-    group_by(SPH) %>% 
-    summarize(
-        HASPNE_pct = mean(HASPNE),
-        n = n()
-    ) %>% 
-    filter(n > 50) %>% 
-    ggplot(aes(SPH, HASPNE_pct, fill = SPH)) +
-    geom_col()+
-    scale_y_continuous(labels = percent)+
-    labs(
-        title = "Percentages of PatternError per SPH",
-        x = "SPH",
-        y = ""
-    )+
-    guides(fill = FALSE)
-```
-
-
-```{r lens_pr_noerr}
-lens_pr_noerr <- lens_pr %>% 
-    filter(LMERRCODE == "NoError")
-```
-
-
-
 ### 3.2 DBP success rate
+
 Among the lenses without an error at the DLM , here is the percentage of successful DBP processing.
 
-```{r DBP_success_rate_plot}
-lens_pr_noerr %>% 
+First let's remove the lenses with a INSAV value greater than 0.5 (in absolute value), a GMC greater than 1 or a ERRCYLV error greater than 0.5.
+
+```{r lens_auto_dbp_nv}
+lens_pr_noerr <- lens_pr %>% 
+    filter(LMERRCODE == "NoError") %>% 
     mutate(
-        DBPVALID = fct_recode(as.factor(DBPVALID), DBP_VALID = "TRUE", DBP_NOT_VALID = "FALSE")
-        ) %>% 
-    geom_bar_cnt("DBPVALID")
+        ERRDRSEQ = INSDRSPH+0.5*INSDRCYL-(LDDRSPH+0.5*LDDRCYL),
+        ERRDRCYLV = sqrt(
+            (INSDRCYL*cos(deg2rad(2*INSDRAX))-LDDRCYL*cos(deg2rad(2*LDDRAX)))^2+
+            (INSDRCYL*sin(deg2rad(2*INSDRAX))-LDDRCYL*sin(deg2rad(2*LDDRAX)))^2
+        )
+    ) %>% 
+    filter(
+        !is.na(INSAV) & abs(INSAV) <= 0.5,
+        !is.na(INSGMC) & abs(INSGMC) <= 1,
+        !is.na(ERRDRCYLV) & abs(ERRDRCYLV) <= 0.5
+    )
+
+geom_bar_cnt(lens_pr_noerr, "DBPVALID")
+
 ```
+
 
 ```{r}
 lens_pr_noerr_dbpvalid <- lens_pr_noerr %>% 
     filter(DBPVALID == TRUE)
 ```
-
 
 See the appendix for a list of the jobs with unsucessful DBP.
 
@@ -371,104 +366,53 @@ Two groups :
 
 ```{r}
 lens_pr_noerr_dbpvalid %>% 
-    ggplot(aes(DBPX)) +
-    geom_histogram(fill = "#F8766D", color = "black", bins = 100) +
+    mutate(HIGHDBPX = DBPX > 0.5) %>% 
+    ggplot(aes(DBPX, fill = HIGHDBPX)) +
+    geom_histogram(color = "black", bins = 100) +
     scale_x_continuous(lim = c(-3,3), breaks = seq(-3,3, by = 0.5)) +
-    geom_vline(xintercept = 0.5)
-```
-
-
-Influence of LNAME
-
-```{r}
-lens_pr_noerr_dbpvalid %>% 
-    mutate(SHIFT = DBPX > 0.5) %>% 
-    group_by(LNAME) %>% 
-    summarize(
-        per = mean(SHIFT),
-        n = n()
-        ) %>% 
-    filter(n > 50) %>% 
-    arrange(desc(per)) %>% 
-    ggplot(aes(LNAME, per)) +
-    geom_col(fill = "#F8766D", color = "black") +
-    coord_flip() +
-    scale_y_continuous(labels = percent) +
-    guides(fill = FALSE) +
+    geom_vline(xintercept = 0.5)+
     labs(
-        title = "Percentage of group 1 or 2 does not depend on LNAME",
+        title = "Two groups for the DBPX values",
         y = "",
-        x = "LNAME"
-         )
-```
-
-Influence of SBOCIN
-
-```{r}
-lens_pr_noerr_dbpvalid %>%
-    filter(abs(DBPX) < 3) %>% 
-    ggplot(aes(SBOCIN, DBPX)) +
-    geom_point(alpha = .2, size = 2, color = "blue") +
-    labs(
-        title = "DBPX does not depend on SBOCIN"
+        x = "DBPX"
     )
 ```
 
-No influence of the eye
+#### Link between DBPX and the ENGRAVER
+
+Here are some data linking the DBPX values and the engraver
+identifier for about 40 lenses.
 
 ```{r}
-lens_pr_noerr_dbpvalid %>%
-    filter(abs(DBPX) < 3) %>%
-    ggplot(aes(DBPX, fill = EYE)) +
-    geom_histogram(bins = 100) +
-    labs("")
+eng_route <-read_csv("data/eng_routes.csv", 
+                     col_types = cols(
+                          JOB = col_character(),
+                          EYE = col_character(),
+                          ENG = col_character(),
+                          TIMESTAMP = col_datetime(format = ""),
+                          DBPX = col_double(),
+                          LDVEN = col_character(),
+                          LNAME = col_character(),
+                          LTYPE = col_character(),
+                          INSGMC = col_double(),
+                          INSGMCDBP = col_double()
+                        )
+                     ) %>% 
+    mutate(ENG = as.factor(ENG))
+
+eng_route %>% 
+    ggplot(aes(DBPX, fill = ENG)) + 
+    geom_histogram(bins = 50, color = "black") +
+    geom_vline(xintercept = 0.5, alpha = .5) +
+    scale_x_continuous(breaks = seq(-3, 3, by = 0.5), limits = c(-3,3)) +
+    labs(
+        title = "The two groups for DBPX are related to the engraver!",
+        x = "DBPX", 
+        y = ""
+    )
+
 ```
 
-
-No influence of the parallax computation
-
-```{r}
-lens_pr_noerr_dbpvalid %>%
-    filter(abs(DBPX) < 3) %>%
-    ggplot(aes(TPERR34X, DBPX))+
-    geom_point(color = "blue", alpha = .2, size = 3)
-```
-
-
-
-#### Link between DBPX and the error on the prismatic value
-
-Here we look at the horizontal prismatic error in term of shift in mm
-using the power. The lenses have been divided into two groups, depending on
-whether the DBPX is greater than 0.5 or not.
-
-
-```{r}
-lens_pr_noerr_dbpvalid %>%
-    mutate(HIGHDBPX = DBPX > 0.5) %>% 
-    filter(abs(DBPX) < 3) %>%
-    mutate(
-        INSPRVH_DBP = extrapolate_prvh(INSPRVH, INSPRVV, INSPRSPH, INSPRCYL, INSPRAX,
-                                        -DBPX, -DBPY, -DBPT),
-        INSPRVV_DBP = extrapolate_prvv(INSPRVH, INSPRVV, INSPRSPH, INSPRCYL, INSPRAX,
-                                        -DBPX, -DBPY, -DBPT),
-        REL_DPRVH = (INSPRVH-LDPRVH)/TOLVPRVH,
-        REL_DPRVV = (INSPRVV-LDPRVV)/TOLVPRVV,
-        REL_DPRVH_DBP = (INSPRVH_DBP - LDPRVH)/TOLVPRVH,
-        REL_DPRVV_DBP = (INSPRVV_DBP - LDPRVV)/TOLVPRVV,
-        DEC = -(INSPRVH - LDPRVH)/LDDRSPH*10,
-        DEC_DBP = -(INSPRVH_DBP - LDPRVH)/LDDRSPH*10
-        ) %>% 
-    ggplot(aes(DEC)) +
-    geom_histogram(aes(fill = HIGHDBPX), bins = 50)+
-    geom_vline(xintercept = 0, alpha = .5)+
-    geom_vline(xintercept = 1, alpha = .5)+
-    facet_wrap(~HIGHDBPX)+
-    scale_x_continuous(breaks = seq(-4, 4, by = 1), limits = c(-4,4))
-```
-
-We see the same distributions are found on the horizontal displacement calculated based on the prism
-measured at the Focovision. This indicates that the shift of 1mm is also measured at the Focovision for half of the lenses.
 
 
 ### 3.4 DBP FE and SE values
@@ -496,23 +440,13 @@ lens_pr_noerr_dbpvalid %>%
 ### 4.1 Relative prism error with DBP OFF and ON
 
 Here are the relative error on the prismatic powers. 
-This errors are the difference between the measured values and the verifications value divided by the tolerance
+These errors are the differences between the measured values and the verification values divided by the tolerance values
 compliant with the ISO8980-2. The values with and without DBP are compared.
 
 ```{r rel prism errors}
 lens_pr_noerr_dbpvalid %>% 
-    mutate(
-        INSPRVH_DBP = extrapolate_prvh(INSPRVH, INSPRVV, INSPRSPH, INSPRCYL, INSPRAX,
-                                        -DBPX, -DBPY, -DBPT),
-        INSPRVV_DBP = extrapolate_prvv(INSPRVH, INSPRVV, INSPRSPH, INSPRCYL, INSPRAX,
-                                        -DBPX, -DBPY, -DBPT),
-        REL_DPRVH = (INSPRVH-LDPRVH)/TOLVPRVH,
-        REL_DPRVV = (INSPRVV-LDPRVV)/TOLVPRVV,
-        REL_DPRVH_DBP = (INSPRVH_DBP - LDPRVH)/TOLVPRVH,
-        REL_DPRVV_DBP = (INSPRVV_DBP - LDPRVV)/TOLVPRVV
-        ) %>% 
     select(REL_DPRVH:REL_DPRVV_DBP) %>% 
-    gather(NAME, VALUE) %>% 
+    gather(NAME, VALUE,REL_DPRVH:REL_DPRVV_DBP) %>% 
     mutate(
         DBP = str_detect(NAME, "DBP"),
         DBP = fct_recode(as.factor(DBP), DPB_OFF = "FALSE", DBP_ON = "TRUE"),
@@ -522,12 +456,44 @@ lens_pr_noerr_dbpvalid %>%
     geom_histogram(bins = 50, aes(fill = NAME), color = "black", alpha = 1)+
     facet_grid(DBP ~ NAME) +
     guides(fill = FALSE) +
-    scale_x_symmetric(lim = c(-1,1), labels = percent)+
+    scale_x_symmetric(lim = c(-2,2), labels = percent)+
     labs(
         x = "Relative prismatic error [%]",
         y = ""
     )
 ```
+
+Here's a comparison of lenses within tolerance (based on a quick evaluation, and
+assuming the ISO8980-2 is applied) and out of tolerance for horizontal and vertical prism before and after DBP.
+
+Note that the DBP would not be applied if a lens was considered out of tolerance 
+when applying it.
+
+
+```{r}
+lens_pr_noerr_dbpvalid %>% 
+    filter(!is.na(REL_DPRVH)) %>% 
+    mutate(
+        PRVH_OUT = abs(REL_DPRVH) > 1,
+        PRVHDBP_OUT = abs(REL_DPRVH_DBP) > 1
+        ) %>% 
+    count(PRVH_OUT, PRVHDBP_OUT) %>% 
+    mutate(percents = n/sum(n)*100) %>% 
+    kable(digits = 1)
+```
+
+```{r}
+lens_pr_noerr_dbpvalid %>% 
+    filter(!is.na(REL_DPRVV)) %>% 
+    mutate(
+        PRVV_OUT = abs(REL_DPRVV) > 1,
+        PRVVDBP_OUT = abs(REL_DPRVV_DBP) > 1
+        ) %>% 
+    count(PRVV_OUT, PRVVDBP_OUT) %>% 
+    mutate(percents = n/sum(n)*100) %>% 
+    kable(digits = 1)
+```
+
 
 ### 4.2 Vector cylinder power errors with DBP OFF and ON
 
@@ -548,16 +514,37 @@ lens_pr_noerr_dbpvalid %>%
         ) %>% 
     ggplot(aes(VALUE)) + 
     #geom_freqpoly(bins = 50, aes(color = DBP)) +
-    geom_histogram(bins = 30, aes(fill = DBP), color = "black", alpha = 1)+
+    geom_histogram(bins = 50, aes(fill = DBP), color = "black", alpha = 1)+
     facet_wrap(~DBP) +
     guides(fill = FALSE) +
-    scale_x_continuous(lim = c(0,0.25))+
+    scale_x_continuous(lim = c(0,0.35))+
     labs(
         x = "CYLV errors [D]",
         y = ""
     )
     
 ```
+
+Here's a comparison of lenses within tolerance (based on a quick evaluation and a tolerance of 0.12D on the cylinder error as a vector, i.e. including cylinder axis) for cylinder and cylinder axis before and after DBP.
+
+```{r}
+lens_pr_noerr_dbpvalid %>% 
+    mutate(
+        DAX = -DBPT,
+        INSDRAX_DBP = INSDRAX-DAX,
+        DCYLV = cylv_diff(INSDRCYL, INSDRAX, LDDRCYL, LDDRAX),
+        DCYLV_DBP = cylv_diff(INSDRCYL, INSDRAX_DBP, LDDRCYL, LDDRAX)
+    ) %>% 
+    mutate(
+        DCYLV_OUT = abs(DCYLV) > 0.12,
+        DCYLV_DBP_OUT = abs(DCYLV_DBP) > 0.12
+        ) %>% 
+    count(DCYLV_OUT, DCYLV_DBP_OUT) %>% 
+    mutate(percents = n/sum(n)*100) %>% 
+    kable(digits = 1)
+```
+
+
 
 ### 4.3 GMC statistics with DBP OFF and ON
 
@@ -580,6 +567,20 @@ lens_pr_noerr_dbpvalid %>%
         x = "INSGMC",
         y = ""
     )
+```
+
+Here's a comparison of lenses within tolerance for GMC
+if the tolerance was fixed at 0.12.
+
+```{r}
+lens_pr_noerr_dbpvalid %>% 
+    mutate(
+        INGMC_OUT = abs(INSGMC) > 0.12,
+        INSGMCDBP_OUT = abs(INSGMCDBP) > 0.12
+        ) %>% 
+    count(INGMC_OUT, INSGMCDBP_OUT) %>% 
+    mutate(percents = n/sum(n)*100) %>% 
+    kable(digits = 1)
 ```
 
 ### 4.4 AV statistics with DBP OFF and ON
@@ -610,87 +611,12 @@ lens_pr_noerr_dbpvalid %>%
 
 ### Unsucessfull DBP jobs
 
-```{r lens_auto_dbp_nv}
-lens_pr_noerr_dbpnotvalid <- lens_pr_noerr %>% 
+
+```{r}
+lens_pr_noerr %>%
     filter(DBPVALID == FALSE) %>% 
-    mutate(
-        ERRDRSEQ = INSDRSPH+0.5*INSDRCYL-(LDDRSPH+0.5*LDDRCYL),
-        ERRDRCYLV = sqrt(
-            (INSDRCYL*cos(deg2rad(2*INSDRAX))-LDDRCYL*cos(deg2rad(2*LDDRAX)))^2+
-            (INSDRCYL*sin(deg2rad(2*INSDRAX))-LDDRCYL*sin(deg2rad(2*LDDRAX)))^2
-        )
-    )
-```
-
-
-Let's look at the `r lens_pr_noerr_dbpnotvalid %>% nrow()` lenses with unsucessful DBP and examine the 
-INSGMC and INSAV values.
-
-
-```{r}
-lens_pr_noerr_dbpnotvalid %>% 
-    mutate(TIMESTAMP = date(TIMESTAMP)) %>%
-    select(TIMESTAMP, JOB, EYE, DBPVALID, INSGMC, INSAV, ERRDRSEQ, ERRDRCYLV, LMERRCODE, LNAME) %>%
-    arrange(desc(abs(INSAV), INSGMC)) %>% 
-    kable()
-```
-
-Let's remove the lenses with a INSAV value greater than 0.5 (in absolute value), a GMC greater than 1
-or a ERRCYLV error greater than 0.5.
-
-
-```{r, lens_pr_noerr_dbpnotvalid_analyse}
-lens_pr_noerr_dbpnotvalid_analyse <- lens_pr_noerr_dbpnotvalid %>% 
-        filter(
-        DBPVALID == FALSE,
-        is.na(INSAV) | abs(INSAV) <= 0.5,
-        is.na(INSAV) | abs(INSGMC) <= 1,
-        is.na(ERRDRCYLV) | abs(ERRDRCYLV) <= 0.5
-        ) 
-```
-The number of remaining lenses is `r lens_pr_noerr_dbpnotvalid_analyse %>% nrow()`.
-
-```{r}
-lens_pr_noerr_dbpnotvalid_analyse %>% 
     mutate(TIMESTAMP = date(TIMESTAMP)) %>% 
     select(TIMESTAMP, JOB, EYE, DBPVALID, INSGMC, INSAV, ERRDRSEQ, ERRDRCYLV, LMERRCODE, LNAME) %>%
     arrange(desc(abs(INSAV), INSGMC)) %>% 
     kable()
 ```
-
-Among those lenses, here are the percentage of LNAME's : 
-```{r}
-lens_pr_noerr_dbpnotvalid_analyse %>% 
-    mutate(TIMESTAMP = date(TIMESTAMP)) %>% 
-    select(TIMESTAMP, JOB, EYE, DBPVALID, INSGMC, INSAV, ERRDRSEQ, ERRDRCYLV, LMERRCODE, LNAME) %>%
-    count(LNAME) %>% 
-    kable()
-```
-
-```{r}
-lens_pr_noerr_dbpvalid %>% 
-    filter(DBPVALID == TRUE) %>% 
-    mutate(
-        ERRDRSEQ = INSDRSPH+0.5*INSDRCYL-(LDDRSPH+0.5*LDDRCYL),
-        ERRDRCYLV = sqrt(
-            (INSDRCYL*cos(deg2rad(2*INSDRAX))-LDDRCYL*cos(deg2rad(2*LDDRAX)))^2+
-            (INSDRCYL*sin(deg2rad(2*INSDRAX))-LDDRCYL*sin(deg2rad(2*LDDRAX)))^2
-        )
-    ) %>% 
-    filter(
-        is.na(INSAV) | abs(INSAV) <= 0.5,
-        is.na(INSAV) | abs(INSGMC) <= 0.6,
-        is.na(ERRDRCYLV) | abs(ERRDRCYLV) <= 0.5
-        ) %>% 
-    select(JOB, EYE, TIMESTAMP, DBPX, LDVEN, LNAME, LTYPE, INSGMC, INSGMCDBP) %>% 
-    write_csv("data/luat_dbp_data_20190304.csv")
-```
-
-
-
-
-
-
-
-
-
